@@ -1,0 +1,292 @@
+﻿#pragma kernel CSMain
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+
+Texture3D<float> _VolumeTexture;
+SamplerState sampler_VolumeTexture;
+Texture2D<float3> _GradientTexture;
+SamplerState sampler_GradientTexture;
+
+float3 _Shape;
+float3 _Spacing;
+float3 _CageDimensions;
+float _SurfaceLow;
+float _NormalBias;
+float _OcclusionDistance;
+float _OcclusionIntensity;
+float _Ambient;
+float4 _FogColor;
+float4 _BackgroundColor;
+float _FogIntensity;
+float _Segmentation;
+float _XRay;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float3 _Light;
+bool positionLight;
+
+static const float maxDst = 25;
+static const float epsilon = 0.001f;
+static const float delta = 0.1f;
+static const float shadowBias = epsilon * 50;
+static const float stepSize = 0.03f;
+
+
+
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+float VolumeDensity(float3 eye){
+    float3 scale = (_Shape/_Shape.x)*(_Spacing/_Spacing.x)*10;
+    float3 p = eye / scale;
+    p = p+float3(0.5f,0.5f,0.5f);
+
+    return max(0,_VolumeTexture.SampleLevel(sampler_VolumeTexture, p, 0.0));
+
+}
+
+float3 GradientColor(float c){
+    return _GradientTexture.SampleLevel(sampler_GradientTexture, float2(c-c%_Segmentation,0.5f), 0.0) ;
+}
+
+float VolumeDistance(float3 eye) {
+    float density = VolumeDensity(eye);
+
+    /*if(density-_SurfaceLow >= stepSize*3){
+        return epsilon*0.5f;
+        
+    }*/
+
+    
+    return (-(density-_SurfaceLow)/_SurfaceLow)*stepSize;
+}
+
+float SphereDistance(float3 eye, float3 centre, float radius) {
+    return distance(eye, centre) - radius;
+}
+
+
+float CubeDistance(float3 eye, float3 centre, float3 size) {
+    float3 o = abs(eye-centre) -size;
+    float ud = length(max(o,0));
+    float n = max(max(min(o.x,0),min(o.y,0)), min(o.z,0));
+    return ud+n;
+}
+
+
+
+Ray CreateRay(float3 origin, float3 direction) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv) {
+    float3 origin = mul(_CameraToWorld, float4(0,0,0,1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv,0,1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction,0)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin,direction);
+}
+
+
+
+float CageDistance(float3 eye){
+    //float c = SphereDistance(eye, float3(0,0,0), 4);
+    float c = CubeDistance(eye, float3(0,0,0), _CageDimensions);
+    return c;
+}
+
+
+
+float4 SceneInfo(float3 eye) {
+    float globalDst = maxDst;
+    float3 globalColour = 1;
+
+    float cageDistance = CageDistance(eye);
+    if(cageDistance <= 0.001f){
+        globalDst = VolumeDistance(eye);
+    }else{
+        globalDst = cageDistance;
+    }  
+   
+    globalColour = float4(0,1,1,1);
+
+
+
+
+    return float4(globalColour, globalDst);
+
+
+}
+
+float3 EstimateNormal(float3 p) {
+    float f = 0.001f*_NormalBias;
+    float x = SceneInfo(float3(p.x+f,p.y,p.z)).w - SceneInfo(float3(p.x-f,p.y,p.z)).w;
+    float y = SceneInfo(float3(p.x,p.y+f,p.z)).w - SceneInfo(float3(p.x,p.y-f,p.z)).w;
+    float z = SceneInfo(float3(p.x,p.y,p.z+f)).w - SceneInfo(float3(p.x,p.y,p.z-f)).w;
+    return normalize(float3(x,y,z));
+}
+
+
+
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width,height;
+    Destination.GetDimensions(width, height);
+
+    Destination[id.xy] = Source[id.xy];
+
+    float2 uv = id.xy / float2(width,height) * 2 - 1;
+    float rayDst = 0;
+
+    Ray ray = CreateCameraRay(uv);
+    int marchSteps = 0;
+    int occlusionSteps;
+    float3 cageInPos = ray.origin;
+    float3 cageOutPos = ray.origin;
+    bool cageHit = false;
+
+    while (rayDst < maxDst) {
+        marchSteps ++;
+
+        float dst = 1;
+
+        float cage = CageDistance(ray.origin);
+        if(cage <= 0.001f){
+
+            // INSIDE CAGE 
+
+            float density = VolumeDensity(ray.origin);
+            
+            float step = (-(density-_SurfaceLow)/_SurfaceLow)*stepSize;
+
+            step = max(epsilon, step);
+
+
+            if(density >= _SurfaceLow - _OcclusionDistance){
+                occlusionSteps += 1;
+                if (density >= _SurfaceLow) {
+
+                    // ---->    SURFACE
+
+                        
+                        
+
+
+                   
+                        
+                        float3 pointOnSurface = ray.origin;
+
+                        float cageDistance = length(pointOnSurface-cageInPos);
+                        float fog = cageDistance;
+
+                        
+
+                        float occlusion = (1-occlusionSteps/(100.0/_OcclusionIntensity));
+
+                        float lighting = 1;
+
+                        float3 col = 1;
+
+                        if(cage < 0){
+                            float3 normal = EstimateNormal(pointOnSurface);
+                            float3 lightDir = (positionLight)?normalize(_Light-pointOnSurface):normalize(mul(_CameraToWorld, float4(0,0,0,1)).xyz-pointOnSurface);
+                            lighting = saturate(saturate(dot(normal,lightDir)));
+                            lighting = _Ambient + (1-_Ambient) * lighting;
+                        }else{
+                            //col = GradientColor(VolumeDensity(pointOnSurface));
+                        }
+
+                        col = 0;
+                        float3 offsetPos = pointOnSurface+ray.direction*_XRay/100.0f;
+                        int offsetSteps = 100;
+                        int s = 0;
+                        while(s<offsetSteps){
+                            float offsetDensity = VolumeDensity(offsetPos);
+                            if(offsetDensity>=_SurfaceLow){
+                                col += GradientColor(offsetDensity)*(1.0f*s/offsetSteps);
+                            }else{
+                                col += float3(1,1,1);
+                            }
+
+                            offsetPos = offsetPos-ray.direction*(_XRay/100.0f/offsetSteps);
+                            s += 1;
+                        }
+
+                        col = col / offsetSteps;
+                        
+                        
+                        //col = 1;
+
+
+
+                        
+
+
+                        //Destination[id.xy] = float4(col * occlusion * lighting, rayDst);
+                        float3 outColor = (col * occlusion) * lighting;
+
+                        outColor = lerp(outColor, lerp(outColor, _FogColor, saturate(fog*_FogIntensity)), _FogColor.a);
+
+
+                        Destination[id.xy] = float4(outColor, rayDst);
+                        return;
+                    
+                }
+            }
+
+            dst = step;
+            cageOutPos = ray.origin;
+            cageHit = true;
+
+        }else{
+            // OUTSIDE CAGE
+
+            dst = cage;
+            if(!cageHit){
+                // BEFORE CAGE
+                cageInPos = ray.origin + dst * ray.direction;
+            }
+        }
+        
+            
+        
+
+     
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+
+
+    }
+
+
+    float3 outColor = _BackgroundColor;
+
+    if(cageHit){
+
+        // ---->    CAGE
+
+
+        float fog = length(cageInPos-cageOutPos);
+        outColor = lerp(outColor, lerp(outColor, _FogColor, saturate(fog*_FogIntensity)), _FogColor.a);
+
+    }
+
+    // ---->    BACKGROUND
+    
+
+
+    Destination[id.xy] = float4(outColor , -1);
+}

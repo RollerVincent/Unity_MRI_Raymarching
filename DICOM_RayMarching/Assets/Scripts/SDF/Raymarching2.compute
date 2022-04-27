@@ -1,0 +1,150 @@
+﻿#pragma kernel CSMain
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+
+Texture3D<float> _VolumeTexture;
+SamplerState LinearClampSampler;
+float3 _Shape;
+float3 _Spacing;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float3 _Light;
+bool positionLight;
+
+static const float maxDst = 80;
+static const float epsilon = 0.001f;
+static const float shadowBias = epsilon * 50;
+
+
+struct Ray {
+    float3 origin;
+    float3 direction;
+};
+
+float VolumeDistance(float3 eye) {
+    float v = _VolumeTexture.SampleLevel(LinearClampSampler, eye, 0.0);
+    
+    return v;
+}
+
+float SphereDistance(float3 eye, float3 centre, float radius) {
+    return distance(eye, centre) - radius;
+}
+
+
+
+Ray CreateRay(float3 origin, float3 direction) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv) {
+    float3 origin = mul(_CameraToWorld, float4(0,0,0,1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv,0,1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction,0)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin,direction);
+}
+
+
+
+
+
+
+float4 SceneInfo(float3 eye) {
+    float globalDst = maxDst;
+    float3 globalColour = 1;
+    
+   
+    globalColour = float4(0,1,0,1);
+    globalDst = (1-VolumeDistance(eye/10/(_Shape/_Shape.x))-0.8f)*0.01f;
+
+    //globalDst = SphereDistance(eye, float3(0,0,0), 10);
+    
+
+
+    return float4(globalColour, globalDst);
+
+
+}
+
+float3 EstimateNormal(float3 p) {
+    float x = SceneInfo(float3(p.x+epsilon,p.y,p.z)).w - SceneInfo(float3(p.x-epsilon,p.y,p.z)).w;
+    float y = SceneInfo(float3(p.x,p.y+epsilon,p.z)).w - SceneInfo(float3(p.x,p.y-epsilon,p.z)).w;
+    float z = SceneInfo(float3(p.x,p.y,p.z+epsilon)).w - SceneInfo(float3(p.x,p.y,p.z-epsilon)).w;
+    return normalize(float3(x,y,z));
+}
+
+float CalculateShadow(Ray ray, float dstToShadePoint) {
+    float rayDst = 0;
+    int marchSteps = 0;
+    float shadowIntensity = .2;
+    float brightness = 1;
+
+    while (rayDst < dstToShadePoint) {
+        marchSteps ++;
+        float4 sceneInfo = SceneInfo(ray.origin);
+        float dst = sceneInfo.w;
+        
+        if (dst <= epsilon) {
+            return shadowIntensity;
+        }
+
+        brightness = min(brightness,dst*200);
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+    return shadowIntensity + (1-shadowIntensity) * brightness;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width,height;
+    Destination.GetDimensions(width, height);
+
+    Destination[id.xy] = Source[id.xy];
+
+    float2 uv = id.xy / float2(width,height) * 2 - 1;
+    float rayDst = 0;
+
+    Ray ray = CreateCameraRay(uv);
+    int marchSteps = 0;
+
+    while (rayDst < maxDst) {
+        marchSteps ++;
+        float4 sceneInfo = SceneInfo(ray.origin);
+        float dst = sceneInfo.w;
+        
+        if (dst <= epsilon) {
+            float3 pointOnSurface = ray.origin + ray.direction * dst;
+            float3 normal = EstimateNormal(pointOnSurface - ray.direction * epsilon);
+            float3 lightDir = (positionLight)?normalize(_Light-ray.origin):-_Light;
+            float lighting = saturate(saturate(dot(normal,lightDir)));
+            float3 col = sceneInfo.xyz;
+            
+            // Shadow
+            float3 offsetPos = pointOnSurface + normal * shadowBias;
+            float3 dirToLight = (positionLight)?normalize(_Light- offsetPos):-_Light;
+
+            ray.origin = offsetPos;
+            ray.direction = dirToLight;
+
+            float dstToLight = (positionLight)?distance(offsetPos,_Light):maxDst;
+            float shadow = CalculateShadow(ray, dstToLight);
+
+            Destination[id.xy] = float4(col * lighting * shadow ,1);
+
+            break;
+        }
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+}
